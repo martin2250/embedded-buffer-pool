@@ -12,7 +12,9 @@
 //! - Acquire APIs take `&'static self`: the pool is intended to live in a `static` item.
 //! - Choose a [`RawMutex`] (`M`) compatible with your executor (for example the
 //!   critical-section mutex in `embassy_sync`).
-//! - `T` must be [`Copy`] because [`BufferPool::new`] is a `const fn`.
+//! - To build the backing `[T; N]` in a `const` context, use `[expr; N]` when that is
+//!   valid for your type, or [`array_new!`] when you need distinct elements or `T` is not
+//!   [`Copy`] (repeat-array syntax requires [`Copy`] in the general case).
 //!
 //! # Example
 //!
@@ -78,7 +80,7 @@ pub struct BufferPool<M: RawMutex, T, const N: usize> {
 unsafe impl<M: RawMutex + Send, T: Send, const N: usize> Send for BufferPool<M, T, N> {}
 unsafe impl<M: RawMutex + Sync, T: Send, const N: usize> Sync for BufferPool<M, T, N> {}
 
-impl<M: RawMutex, T: Copy, const N: usize> BufferPool<M, T, N> {
+impl<M: RawMutex, T, const N: usize> BufferPool<M, T, N> {
     /// Creates a pool with the given backing storage; all slots start available.
     ///
     /// # Valid `N`
