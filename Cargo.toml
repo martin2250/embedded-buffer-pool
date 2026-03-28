@@ -1,0 +1,16 @@
+[package]
+name = "embedded-buffer-pool"
+version = "0.1.0"
+edition = "2024"
+authors = ["Martin Pittermann"]
+rust-version = "1.85"
+description = "Fixed-size async buffer pool for no_std firmware using embassy-sync."
+documentation = "https://docs.rs/embedded-buffer-pool"
+readme = "README.md"
+keywords = ["embedded", "no-std", "async", "buffer-pool", "embassy"]
+categories = ["embedded", "no-std", "asynchronous"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/martin2250/embedded-buffer-pool"
+
+[dependencies]
+embassy-sync = "0.8"
