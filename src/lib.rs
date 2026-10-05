@@ -1,261 +1,494 @@
 #![no_std]
 
-//! Fixed-size [`BufferPool`] for [`no_std`] firmware using [`embassy_sync`].
+//! Async pools of **1..=32** buffers for `no_std` firmware.
 //!
-//! The pool holds `N` values of type `T` (**1..=32** slots). A bitmask tracks which
-//! slots are free; [`BufferGuard`] and [`MappedBufferGuard`] return a slot to the pool on
-//! [`Drop`]. When the pool is empty, [`BufferPool::take`] registers a waker and completes
-//! when another task releases a buffer.
+//! [`BufferPool`] borrows a slice and can be constructed at runtime.
+//! [`StaticBufferPool`] owns an array and has a const constructor. Both return
+//! [`BufferGuard`] values that keep a physical slot reserved until dropped.
+//! Neither acquisition nor mapping allocates.
 //!
-//! # Requirements
+//! # Runtime storage
 //!
-//! - Acquire APIs take `&'static self`: the pool is intended to live in a `static` item.
-//! - Choose a [`RawMutex`] (`M`) compatible with your executor (for example the
-//!   critical-section mutex in `embassy_sync`).
-//! - To build the backing `[T; N]` in a `const` context, use `[expr; N]` when that is
-//!   valid for your type, or [`array_new!`] when you need distinct elements or `T` is not
-//!   [`Copy`] (repeat-array syntax requires [`Copy`] in the general case).
+//! ```
+//! use embedded_buffer_pool::{BufferGuard, BufferPool};
+//! use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 //!
-//! # Example
+//! let mut items = [[0u8; 64]; 2];
+//! let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+//! let mut slice = BufferGuard::map(pool.try_take().unwrap(), |b| &mut b[..16]);
+//! slice[0] = 0xAA;
+//! drop(slice);
+//! assert_eq!(pool.try_take().unwrap()[0], 0xAA);
+//! ```
 //!
-//! ```rust,ignore
-//! use embedded_buffer_pool::BufferPool;
+//! # Owning static storage
+//!
+//! ```
+//! use embedded_buffer_pool::{BufferPool, StaticBufferPool};
 //! use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 //!
-//! /// Shared pool: two 64-byte packet buffers.
-//! static POOL: BufferPool<CriticalSectionRawMutex, [u8; 64], 2> =
-//!     BufferPool::new([[0u8; 64]; 2]);
+//! static POOL: StaticBufferPool<CriticalSectionRawMutex, [u8; 64], 2> =
+//!     StaticBufferPool::new([[0; 64]; 2]);
 //!
-//! fn try_fill() -> Option<()> {
-//!     let mut guard = POOL.try_take()?;
-//!     guard[0] = 0xAA;
-//!     Some(())
+//! async fn fill(pool: &BufferPool<'_, CriticalSectionRawMutex, [u8; 64]>) {
+//!     let mut buffer = pool.take().await;
+//!     buffer[0] = 0xBB;
 //! }
 //!
-//! async fn wait_for_buffer() {
-//!     let mut guard = POOL.take().await;
-//!     guard[0] = 0xBB;
+//! async fn example() {
+//!     fill(&POOL).await; // Deref coercion supplies the borrowed pool view.
 //! }
 //! ```
 //!
-//! [`embassy_sync`]: https://docs.rs/embassy-sync
-//! [`no_std`]: https://doc.rust-lang.org/nomicon/no-std.html
+//! Use an inline const expression such as `[const { Thing::new() }; 16]` to
+//! construct arrays of non-`Copy` values in a const context.
 //!
-//! For arrays built by repeating an expression (constructors, `const` values, literals),
-//! see [`array_new`].
+//! # Waiting
+//!
+//! Each pool stores one waker. A different waiting task replaces and wakes the
+//! previous registration, so several waiting tasks can cause contention;
+//! acquisition order is not guaranteed. [`BufferPool::try_take`] can claim a free
+//! slot even while tasks are waiting. Canceling an acquisition may leave a
+//! harmless stale waker. Forgetting a guard retains its slot. Choose a [`RawMutex`]
+//! suitable for the executor and interrupt contexts sharing the pool.
 
-mod macros;
-
-use core::cell::UnsafeCell;
-use core::future::poll_fn;
+use core::cell::{RefCell, UnsafeCell};
+use core::future::{Future, poll_fn};
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::task::Poll;
+use core::task::{Poll, Waker};
 
-use embassy_sync::{
-    blocking_mutex::{Mutex, raw::RawMutex},
-    waitqueue::WakerRegistration,
-};
+use embassy_sync::blocking_mutex::{Mutex, raw::RawMutex};
 
-#[repr(transparent)]
-#[derive(Debug)]
-struct BufferPtr<T: ?Sized>(*mut T);
+struct ItemPtr(*mut ());
 
-unsafe impl<T: ?Sized> Send for BufferPtr<T> {}
-unsafe impl<T: ?Sized> Sync for BufferPtr<T> {}
+// SAFETY: the erased pointer is only read or updated under the state mutex. It
+// never grants item access by itself; BufferPool's Send/Sync bounds and storage
+// lifetime account for T, and only a claimed slot is turned into a reference.
+unsafe impl Send for ItemPtr {}
 
 struct State {
-    /// Bitmask of free slots: bit `i` set means slot `i` is available.
+    items: ItemPtr,
+    /// Bit i is set exactly when physical slot i is free.
     available: u32,
-    waker: WakerRegistration,
+    waker: Option<Waker>,
 }
 
-/// Pool of `N` buffers of type `T`, synchronized with mutex `M`.
+impl State {
+    /// Caller has checked that at least one slot is available.
+    fn claim(&mut self) -> usize {
+        let index = self.available.trailing_zeros() as usize;
+        self.available &= !(1 << index);
+        index
+    }
+}
+
+/// A pool borrowing **1..=32** values, synchronized with mutex `M`.
 ///
-/// Free slots are tracked with a `u32` bitmask, so **`N` must be in 1..=32**.
-pub struct BufferPool<M: RawMutex, T, const N: usize> {
-    buffer: UnsafeCell<[T; N]>,
-    state: Mutex<M, State>,
+/// `'items` is the lifetime of the backing slice. Acquired guards and pending
+/// futures borrow the pool itself, so they cannot outlive or move it.
+///
+/// ```compile_fail
+/// use embedded_buffer_pool::BufferPool;
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// let guard;
+/// {
+///     let mut items = [0u8];
+///     let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+///     guard = pool.try_take().unwrap();
+/// }
+/// assert_eq!(*guard, 0); // The pool and its storage have been dropped.
+/// ```
+///
+/// ```compile_fail
+/// use embedded_buffer_pool::BufferPool;
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// let mut items = [0u8];
+/// let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+/// items[0] = 1; // The pool exclusively borrows the backing slice.
+/// let _guard = pool.try_take();
+/// ```
+///
+/// ```compile_fail
+/// use embedded_buffer_pool::BufferPool;
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// let pending;
+/// {
+///     let mut items = [0u8];
+///     let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+///     pending = pool.take();
+/// }
+/// drop(pending); // A future also borrows its pool.
+/// ```
+pub struct BufferPool<'items, M: RawMutex, T> {
+    state: Mutex<M, RefCell<State>>,
+    capacity: u8,
+    items: PhantomData<&'items mut [T]>,
 }
 
-unsafe impl<M: RawMutex + Send, T: Send, const N: usize> Send for BufferPool<M, T, N> {}
-unsafe impl<M: RawMutex + Sync, T: Send, const N: usize> Sync for BufferPool<M, T, N> {}
+// SAFETY: transferring a pool transfers its exclusive backing-storage borrow.
+// Access to shared bookkeeping is synchronized by M.
+unsafe impl<M: RawMutex + Send, T: Send> Send for BufferPool<'_, M, T> {}
+// SAFETY: the bitmap grants exclusive access to disjoint physical slots; sharing
+// the pool does not share references to T. Moving a slot between threads needs
+// T: Send, while the mutex must support shared access.
+unsafe impl<M: RawMutex + Sync, T: Send> Sync for BufferPool<'_, M, T> {}
 
-impl<M: RawMutex, T, const N: usize> BufferPool<M, T, N> {
-    /// Creates a pool with the given backing storage; all slots start available.
+impl<'items, M: RawMutex, T> BufferPool<'items, M, T> {
+    /// Borrows a slice with all slots initially available.
     ///
-    /// # Valid `N`
-    ///
-    /// `N` must be in **1..=32**. Otherwise [`BufferPool::new`] panics when run, or fails
-    /// const evaluation if used in a `const` item.
-    pub const fn new(buffer: [T; N]) -> Self {
-        assert!(N > 0 && N <= 32);
+    /// Panics unless the slice length is in **1..=32**. In const evaluation an
+    /// invalid length is a compilation error. T need not be Copy or `'static`.
+    pub const fn new(items: &'items mut [T]) -> Self {
+        let len = items.len();
+        assert!(len > 0 && len <= 32, "buffer count must be in 1..=32");
+        Self::from_raw(items.as_mut_ptr(), len)
+    }
+
+    // The pointer must cover len exclusively borrowed items before this pool is
+    // exposed. StaticBufferPool keeps its unbound pool private until Deref binds it.
+    const fn from_raw(items: *mut T, len: usize) -> Self {
         Self {
-            buffer: UnsafeCell::new(buffer),
-            state: Mutex::new(State {
-                available: u32::MAX >> (32 - N),
-                waker: WakerRegistration::new(),
-            }),
+            state: Mutex::new(RefCell::new(State {
+                items: ItemPtr(items.cast()),
+                available: u32::MAX >> (32 - len),
+                waker: None,
+            })),
+            capacity: len as u8,
+            items: PhantomData,
         }
     }
 
-    /// Tries to take one buffer without blocking. Returns [`None`] if the pool is empty.
-    pub fn try_take(&'static self) -> Option<BufferGuard<M, T>> {
-        unsafe {
-            self.state.lock_mut(|state| {
-                if state.available == 0 {
-                    return None;
-                }
-                let index = state.available.trailing_zeros() as usize;
-                state.available &= !(1 << index);
-                let buffer = &mut (*self.buffer.get())[index];
-                Some(BufferGuard {
-                    store: &self.state,
-                    ptr: BufferPtr(buffer),
-                    index,
-                })
-            })
-        }
+    /// Total number of slots, including currently reserved slots.
+    pub const fn capacity(&self) -> usize {
+        self.capacity as usize
     }
 
-    /// Waits until a buffer is available, then returns a guard.
-    ///
-    /// If the pool is empty, the current task’s waker is registered; when another task
-    /// drops a [`BufferGuard`] or [`MappedBufferGuard`], waiters are woken.
-    pub fn take(&'static self) -> impl Future<Output = BufferGuard<M, T>> {
-        poll_fn(|cx| unsafe {
-            self.state.lock_mut(|state| {
-                if state.available == 0 {
-                    state.waker.register(cx.waker());
-                    return Poll::Pending;
-                }
-                let index = state.available.trailing_zeros() as usize;
-                state.available &= !(1 << index);
-                let buffer = &mut (*self.buffer.get())[index];
-                Poll::Ready(BufferGuard {
-                    store: &self.state,
-                    ptr: BufferPtr(buffer),
-                    index,
-                })
-            })
+    /// Number of slots currently free. This is a snapshot, not a reservation.
+    pub fn available(&self) -> usize {
+        self.state
+            .lock(|state| state.borrow().available.count_ones() as usize)
+    }
+
+    /// Claims a free slot immediately, including when async tasks are waiting.
+    // Interior mutability is checked by the slot bitmap; this is a guard, not an
+    // unrestricted mutable reference derived from shared input.
+    #[allow(clippy::mut_from_ref)]
+    pub fn try_take(&self) -> Option<BufferGuard<'_, M, &mut T>> {
+        self.state.lock(|state| {
+            let mut state = state.borrow_mut();
+            if state.available == 0 {
+                return None;
+            }
+            let index = state.claim();
+            // SAFETY: the bit was cleared under this mutex. The pointer covers
+            // the backing storage and only this slot is borrowed, not the slice.
+            Some(unsafe { self.guard(state.items.0.cast::<T>().add(index), index) })
         })
     }
-}
 
-/// Exclusive handle to one pooled `T`. Releasing the slot on [`Drop`].
-///
-/// Derefs to `T` via [`Deref`] / [`DerefMut`]. Use [`BufferGuard::map`] to borrow a
-/// subfield or slice while keeping the same pool slot.
-pub struct BufferGuard<M: RawMutex + 'static, T> {
-    store: &'static Mutex<M, State>,
-    ptr: BufferPtr<T>,
-    index: usize,
-}
-
-impl<M: RawMutex + 'static, T> Drop for BufferGuard<M, T> {
-    fn drop(&mut self) {
-        unsafe {
-            self.store.lock_mut(|state| {
-                state.available |= 1 << self.index;
-                state.waker.wake();
-            });
-        }
-    }
-}
-
-impl<M: RawMutex + 'static, T> Deref for BufferGuard<M, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.ptr.0 }
-    }
-}
-
-impl<M: RawMutex + 'static, T> DerefMut for BufferGuard<M, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.ptr.0 }
-    }
-}
-
-impl<M: RawMutex + 'static, T> BufferGuard<M, T> {
-    /// Narrows the guard to a `&mut U` derived from the buffer (for example a slice into
-    /// a larger `[u8]`). The original guard is consumed without running its [`Drop`]; the
-    /// returned [`MappedBufferGuard`] still returns the pool slot when dropped.
+    /// Waits infallibly for a slot using one shared waker registration.
     ///
-    /// This is an **associated function**, not a method: the guard is passed as `orig`,
-    /// not `self`. You call it as `BufferGuard::map(guard, f)`. If the first parameter
-    /// were `self`, `guard.map(...)` would always resolve to this routine and **shadow**
-    /// a `map` method on `T`; with `orig: Self`, `guard.map(...)` can still go through
-    /// [`Deref`] / [`DerefMut`] to `T::map` when you want the inner value’s API.
-    pub fn map<U: ?Sized>(
-        orig: Self,
-        fun: impl FnOnce(&mut T) -> &mut U,
-    ) -> MappedBufferGuard<M, U> {
-        let store = orig.store;
-        let index = orig.index;
-        let value = fun(unsafe { &mut *orig.ptr.0 });
-        // Ownership of the slot is moved to the mapped guard; do not run `BufferGuard::drop`.
-        core::mem::forget(orig);
-        MappedBufferGuard {
-            store,
-            value,
-            index,
-        }
-    }
-}
-
-/// Like [`BufferGuard`], but derefs to a borrowed `U` (often a slice or inner field).
-///
-/// Dropping this guard marks the same pool index free as the original [`BufferGuard`].
-pub struct MappedBufferGuard<M: RawMutex + 'static, U: ?Sized> {
-    store: &'static Mutex<M, State>,
-    index: usize,
-    value: *mut U,
-}
-
-impl<M: RawMutex + 'static, U: ?Sized> Drop for MappedBufferGuard<M, U> {
-    fn drop(&mut self) {
-        unsafe {
-            self.store.lock_mut(|state| {
-                state.available |= 1 << self.index;
-                state.waker.wake();
+    /// A new task replaces and wakes the previous waiter. Wake notifications
+    /// happen after unlocking; polling and slot publication cannot lose a wake.
+    /// Dropping a pending future may leave its waker registered until replacement
+    /// or the next release. Acquisition order is not guaranteed.
+    pub fn take(&self) -> impl Future<Output = BufferGuard<'_, M, &mut T>> + '_ {
+        poll_fn(move |cx| {
+            // Waker cloning, dropping, and waking can execute user code. Keep
+            // those operations outside the mutex and its RefCell borrow.
+            let mut new_waker = Some(cx.waker().clone());
+            let (result, replaced) = self.state.lock(|state| {
+                let mut state = state.borrow_mut();
+                if state.available != 0 {
+                    let index = state.claim();
+                    // SAFETY: same exclusive-slot invariant as try_take.
+                    let guard = unsafe { self.guard(state.items.0.cast::<T>().add(index), index) };
+                    return (Poll::Ready(guard), None);
+                }
+                if state
+                    .waker
+                    .as_ref()
+                    .is_some_and(|old| old.will_wake(cx.waker()))
+                {
+                    return (Poll::Pending, None);
+                }
+                let replaced = core::mem::replace(&mut state.waker, new_waker.take());
+                (Poll::Pending, replaced)
             });
+            if let Some(waker) = replaced {
+                waker.wake();
+            }
+            result
+        })
+    }
+
+    // SAFETY: items points to the exclusively claimed slot and remains valid
+    // for the pool borrow. Its bit stays clear until the token is dropped.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn guard(&self, items: *mut T, index: usize) -> BufferGuard<'_, M, &mut T> {
+        BufferGuard {
+            value: items,
+            token: ReleaseToken {
+                state: &self.state,
+                index,
+            },
+            reference: PhantomData,
         }
     }
 }
 
-impl<M: RawMutex + 'static, U: ?Sized> Deref for MappedBufferGuard<M, U> {
-    type Target = U;
+/// An owning pool with a const constructor, suitable for a `static` item.
+///
+/// Dereferences to [`BufferPool`], so functions taking `&BufferPool` accept
+/// `&StaticBufferPool`. N determines the owned array's layout and must be in
+/// **1..=32**. T need not be Copy, but must be `'static` for this owning type.
+/// The wrapper can also be used locally and moved between borrows.
+///
+/// ```compile_fail
+/// use embedded_buffer_pool::StaticBufferPool;
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// let pool = StaticBufferPool::<NoopRawMutex, _, 1>::new([0u8]);
+/// let guard = pool.try_take().unwrap();
+/// let moved = pool; // A usable guard keeps the owner borrowed.
+/// assert_eq!(*guard, 0);
+/// ```
+pub struct StaticBufferPool<M: RawMutex, T: 'static, const N: usize> {
+    // Drop the pool's bookkeeping (including any stale waker) before the items.
+    pool: BufferPool<'static, M, T>,
+    items: UnsafeCell<[T; N]>,
+}
+
+// SAFETY: the owned items are accessed only through the mutex-protected slot
+// bitmap. Pointer binding is also protected by that mutex, and borrows of this
+// owner keep its storage immobile while guards/futures can use it.
+unsafe impl<M: RawMutex + Sync, T: Send, const N: usize> Sync for StaticBufferPool<M, T, N> {}
+
+impl<M: RawMutex, T, const N: usize> StaticBufferPool<M, T, N> {
+    /// Owns an array with all slots initially available.
+    ///
+    /// Panics unless N is in **1..=32**, or fails const evaluation in a static.
+    pub const fn new(items: [T; N]) -> Self {
+        assert!(N > 0 && N <= 32, "buffer count must be in 1..=32");
+        Self {
+            pool: BufferPool::from_raw(core::ptr::null_mut(), N),
+            items: UnsafeCell::new(items),
+        }
+    }
+}
+
+impl<M: RawMutex, T, const N: usize> Deref for StaticBufferPool<M, T, N> {
+    type Target = BufferPool<'static, M, T>;
 
     fn deref(&self) -> &Self::Target {
+        // Never create &mut [T; N]: other physical slots may have live guards.
+        // Refresh on every exposure, because a local owner can move between
+        // borrows. No safe API exposes the unbound pool or moves it out.
+        self.pool.state.lock(|state| {
+            state.borrow_mut().items = ItemPtr(self.items.get().cast());
+        });
+        &self.pool
+    }
+}
+
+struct ReleaseToken<'pool, M: RawMutex> {
+    state: &'pool Mutex<M, RefCell<State>>,
+    index: usize,
+}
+
+impl<M: RawMutex> Drop for ReleaseToken<'_, M> {
+    fn drop(&mut self) {
+        let waker = self.state.lock(|state| {
+            let mut state = state.borrow_mut();
+            state.available |= 1 << self.index;
+            state.waker.take()
+        });
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// Owns the reservation of one physical pool slot.
+///
+/// A `BufferGuard<&mut T>` dereferences to T and supports mutation; a
+/// `BufferGuard<&T>` dereferences to T with shared access. The reference payload
+/// stays private: references obtained through Deref borrow the guard, so they
+/// cannot remain usable after its slot is released.
+///
+/// Use [`BufferGuard::map`] for mutable projection and [`BufferGuard::map_ref`]
+/// for shared projection. A struct can own a guard to retain its slot across
+/// function returns or await points:
+///
+/// ```
+/// use embedded_buffer_pool::{BufferGuard, BufferPool};
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// struct Packet<'pool> {
+///     buffer: BufferGuard<'pool, NoopRawMutex, &'pool mut [u8]>,
+/// }
+/// fn packet<'pool>(pool: &'pool BufferPool<'_, NoopRawMutex, [u8; 64]>)
+///     -> Packet<'pool>
+/// {
+///     Packet { buffer: BufferGuard::map(pool.try_take().unwrap(), |b| &mut b[..]) }
+/// }
+/// let mut items = [[0; 64]];
+/// let pool = BufferPool::new(&mut items);
+/// let mut packet = packet(&pool);
+/// packet.buffer[0] = 42;
+/// assert_eq!(pool.available(), 0);
+/// drop(packet);
+/// assert_eq!(pool.available(), 1);
+/// ```
+///
+/// ```compile_fail
+/// use embedded_buffer_pool::{BufferGuard, BufferPool};
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// let mut items = [[0u8; 4]];
+/// let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+/// let mut shared = BufferGuard::map_ref(pool.try_take().unwrap(), |b| &b[..]);
+/// shared[0] = 1; // A shared guard has no DerefMut.
+/// ```
+///
+/// ```compile_fail
+/// use embedded_buffer_pool::{BufferGuard, BufferPool};
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// let mut items = [0u8];
+/// let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+/// let shared = BufferGuard::map_ref(pool.try_take().unwrap(), |b| b);
+/// let escaped = &*shared;
+/// drop(shared);
+/// assert_eq!(*escaped, 0); // References borrow the guard, not just the pool.
+/// ```
+///
+/// Guard thread safety follows both the reference type and the mutex:
+///
+/// ```compile_fail
+/// use core::cell::Cell;
+/// use embedded_buffer_pool::BufferGuard;
+/// use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<BufferGuard<'static, CriticalSectionRawMutex, &'static mut Cell<u8>>>();
+/// ```
+///
+/// ```compile_fail
+/// use core::cell::Cell;
+/// use embedded_buffer_pool::BufferGuard;
+/// use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+/// fn require_send<T: Send>() {}
+/// require_send::<BufferGuard<'static, CriticalSectionRawMutex, &'static Cell<u8>>>();
+/// ```
+///
+/// ```compile_fail
+/// use embedded_buffer_pool::BufferGuard;
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// fn require_send<T: Send>() {}
+/// require_send::<BufferGuard<'static, NoopRawMutex, &'static mut u8>>();
+/// ```
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+/// use embedded_buffer_pool::BufferGuard;
+/// use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+/// fn require_send<T: Send>() {}
+/// require_send::<BufferGuard<'static, CriticalSectionRawMutex, &'static mut Rc<u8>>>();
+/// ```
+pub struct BufferGuard<'pool, M: RawMutex, V: Deref> {
+    // V is a reference type describing access, rather than a stored reference.
+    // An actual &mut T here would be protected for the entire mem::drop call,
+    // including token release, preventing a woken task from reclaiming the slot.
+    // The pointer's referent remains valid for 'pool; Deref only makes short loans.
+    value: *mut V::Target,
+    token: ReleaseToken<'pool, M>,
+    reference: PhantomData<V>,
+}
+
+// SAFETY: the pointer represents the reference V, whose Send/Sync bounds specify
+// whether its referent may be accessed on another thread. Transferring/sharing
+// the release token requires a mutex that can be shared. Deref loans remain tied
+// to the guard; ownership of the physical reservation is never duplicated.
+unsafe impl<M: RawMutex + Sync, V: Deref + Send> Send for BufferGuard<'_, M, V> {}
+unsafe impl<M: RawMutex + Sync, V: Deref + Sync> Sync for BufferGuard<'_, M, V> {}
+
+impl<M: RawMutex, V: Deref> Deref for BufferGuard<'_, M, V> {
+    type Target = V::Target;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the token retains this slot and the reference marker retains
+        // its backing-storage lifetime. The returned loan borrows this guard.
         unsafe { &*self.value }
     }
 }
 
-impl<M: RawMutex + 'static, U: ?Sized> DerefMut for MappedBufferGuard<M, U> {
+impl<M: RawMutex, V: DerefMut> DerefMut for BufferGuard<'_, M, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: only mutable-reference payloads implement DerefMut. This
+        // exclusive borrow of the guard prevents overlapping guard-derived loans.
         unsafe { &mut *self.value }
     }
 }
 
-impl<M: RawMutex + 'static, U: ?Sized> MappedBufferGuard<M, U> {
-    /// Chains [`BufferGuard::map`]: re-borrows `&mut U` into `&mut V` without releasing the
-    /// pool slot until the final mapped guard is dropped.
+impl<'pool, M: RawMutex, T: ?Sized> BufferGuard<'pool, M, &'pool mut T> {
+    /// Projects to a mutable field or slice, retaining the original slot.
     ///
-    /// Same as [`BufferGuard::map`]: `orig: Self` instead of `self`, so call
-    /// `MappedBufferGuard::map(guard, f)` and keep `guard.map(...)` available for `U::map`
-    /// via [`Deref`] / [`DerefMut`].
-    pub fn map<V: ?Sized>(
+    /// Call `BufferGuard::map(guard, f)`. This is an associated function so it
+    /// does not shadow a map method on the inner T. The closure must work for
+    /// any input borrow lifetime; it cannot save the buffer reference elsewhere.
+    /// If it panics, the original slot is released.
+    ///
+    /// ```compile_fail
+    /// use embedded_buffer_pool::{BufferGuard, BufferPool};
+    /// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    /// let mut items = [0u8];
+    /// let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+    /// let mut escaped = None;
+    /// let mapped = BufferGuard::map(pool.try_take().unwrap(), |buffer| {
+    ///     escaped = Some(buffer); // A projection cannot leak its input borrow.
+    ///     escaped.as_deref_mut().unwrap()
+    /// });
+    /// drop(mapped);
+    /// let _ = escaped;
+    /// ```
+    pub fn map<U: ?Sized>(
         orig: Self,
-        fun: impl FnOnce(&mut U) -> &mut V,
-    ) -> MappedBufferGuard<M, V> {
-        let store = orig.store;
-        let index = orig.index;
-        let value = fun(unsafe { &mut *orig.value });
-        core::mem::forget(orig);
-        MappedBufferGuard {
-            store,
+        fun: impl for<'a> FnOnce(&'a mut T) -> &'a mut U,
+    ) -> BufferGuard<'pool, M, &'pool mut U> {
+        // SAFETY: orig retains exclusive access to its slot. The closure's
+        // higher-ranked borrow cannot escape, and ends before token transfer.
+        let value = fun(unsafe { &mut *orig.value }) as *mut U;
+        let Self { token, .. } = orig;
+        BufferGuard {
             value,
-            index,
+            token,
+            reference: PhantomData,
         }
     }
 }
+
+impl<'pool, M: RawMutex, V: Deref> BufferGuard<'pool, M, V> {
+    /// Projects a mutable or shared guard to shared access, retaining its slot.
+    ///
+    /// Call `BufferGuard::map_ref(guard, f)`. This also chains shared projections.
+    /// The returned reference is tied to the input borrow and cannot escape into
+    /// the closure's captured state. If the closure panics, the slot is released.
+    pub fn map_ref<U: ?Sized>(
+        orig: Self,
+        fun: impl for<'a> FnOnce(&'a V::Target) -> &'a U,
+    ) -> BufferGuard<'pool, M, &'pool U> {
+        // SAFETY: orig retains its physical slot. The closure can only return a
+        // reference valid for this input borrow and cannot leak it elsewhere.
+        let value = fun(unsafe { &*orig.value }) as *const U;
+        let Self { token, .. } = orig;
+        BufferGuard {
+            // Retain the projection's provenance/metadata without making a
+            // long-lived reference. The shared marker prohibits DerefMut.
+            value: value.cast_mut(),
+            token,
+            reference: PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+extern crate std;
+#[cfg(test)]
+mod tests;
