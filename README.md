@@ -60,10 +60,35 @@ struct Packet<'pool> {
 }
 ```
 
-Both projection functions consume their input guard and retain exactly its
+All projection functions consume their input guard and retain exactly its
 original slot. Shared projections can be chained with `map_ref`. A projection
 panic releases the slot. The public API does not expose the contained reference
 independently of the guard's lifetime.
+
+Use `map_mut_ref` when a method needs mutable access but returns a shared
+reference, such as `Thing::do_sth(&mut self) -> &[u8]`:
+
+```rust
+use embedded_buffer_pool::{BufferGuard, BufferPool};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+
+struct Thing([u8; 4]);
+impl Thing {
+    fn do_sth(&mut self) -> &[u8] {
+        self.0[1] = 42;
+        &self.0[1..3]
+    }
+}
+
+let mut items = [Thing([0; 4])];
+let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+let bytes = BufferGuard::map_mut_ref(pool.try_take().unwrap(), Thing::do_sth);
+assert_eq!(&*bytes, &[42, 0]);
+drop(bytes); // Releases the original Thing's slot.
+```
+
+The returned `BufferGuard<'pool, M, &'pool [u8]>` provides shared access. Use
+`map` for mutable input and output, or `map_ref` for shared input and output.
 
 ## Waiting
 

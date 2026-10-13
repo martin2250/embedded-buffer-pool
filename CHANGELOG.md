@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BufferGuard::map_mut_ref` supports projections that take mutable input and
+  return a shared reference, retaining the original pool slot.
 - `StaticBufferPool<M, T, N>` owns an array, has a const constructor, and
   dereferences to `BufferPool`. Local owners can move between borrows.
 - `capacity()` and `available()` queries, plus lifetime, mapping, static storage,

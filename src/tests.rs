@@ -162,6 +162,84 @@ fn mutable_projections_transfer_exactly_one_slot() {
 }
 
 #[test]
+fn mutable_method_projects_to_shared_slice_and_retains_its_slot() {
+    struct Thing([u8; 4]);
+
+    impl Thing {
+        fn do_sth(&mut self) -> &[u8] {
+            self.0[1] = 42;
+            &self.0[1..3]
+        }
+    }
+
+    let mut items = [Thing([0; 4]), Thing([7; 4])];
+    let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+    let guard = pool.try_take().unwrap();
+    let index = guard.token.index;
+    let shared = BufferGuard::map_mut_ref(guard, Thing::do_sth);
+    assert_eq!(&*shared, &[42, 0]);
+    assert_eq!(shared.token.index, index);
+    assert_eq!(pool.available(), 1);
+    let other = pool.try_take().unwrap();
+    assert_ne!(other.token.index, index);
+    assert_eq!(other.0, [7; 4]);
+    assert!(pool.try_take().is_none());
+
+    let shared = BufferGuard::map_ref(shared, |b| &b[0]);
+    assert_eq!(*shared, 42);
+    assert_eq!(shared.token.index, index);
+    assert!(pool.try_take().is_none());
+    drop(shared);
+    assert_eq!(pool.available(), 1);
+    let restored = pool.try_take().unwrap();
+    assert_eq!(restored.token.index, index);
+    assert_eq!(restored.0, [0, 42, 0, 0]);
+    drop((restored, other));
+    assert_eq!(pool.available(), 2);
+}
+
+#[test]
+fn mutable_to_shared_projection_accepts_unsized_input_from_an_owned_pool() {
+    let pool = StaticBufferPool::<NoopRawMutex, _, 1>::new([[0u8; 4]]);
+    let slice = BufferGuard::map(pool.try_take().unwrap(), |b| &mut b[..]);
+    let shared = BufferGuard::map_mut_ref(slice, |b| {
+        b[1] = 42;
+        &b[1..3]
+    });
+    assert_eq!(&*shared, &[42, 0]);
+    assert!(pool.try_take().is_none());
+    drop(shared);
+    assert_eq!(pool.available(), 1);
+    assert_eq!(*pool.try_take().unwrap(), [0, 42, 0, 0]);
+}
+
+#[test]
+fn mutable_to_shared_projection_panic_releases_and_wakes_once() {
+    let mut items = [[0u8; 4]];
+    let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+    let guard = pool.try_take().unwrap();
+    let (count, waker) = waker();
+    let mut pending = Box::pin(pool.take());
+    assert!(poll(&mut pending, &waker).is_pending());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BufferGuard::map_mut_ref(guard, |b| -> &[u8] {
+            b[1] = 42;
+            panic!("shared projection failed");
+        });
+    }));
+    assert!(result.is_err());
+    assert_eq!(pool.available(), 1);
+    assert_eq!(count.count(), 1);
+    let restored = ready(poll(&mut pending, &waker));
+    assert_eq!(*restored, [0, 42, 0, 0]);
+    assert_eq!(pool.available(), 0);
+    drop(restored);
+    assert_eq!(pool.available(), 1);
+    assert_eq!(count.count(), 1);
+}
+
+#[test]
 fn shared_projections_chain_and_retain_the_slot() {
     let mut items = [[7u8; 4]];
     let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);

@@ -316,7 +316,8 @@ impl<M: RawMutex> Drop for ReleaseToken<'_, M> {
 /// stays private: references obtained through Deref borrow the guard, so they
 /// cannot remain usable after its slot is released.
 ///
-/// Use [`BufferGuard::map`] for mutable projection and [`BufferGuard::map_ref`]
+/// Use [`BufferGuard::map`] for mutable projection, [`BufferGuard::map_mut_ref`]
+/// to mutate before projecting to shared access, and [`BufferGuard::map_ref`]
 /// for shared projection. A struct can own a guard to retain its slot across
 /// function returns or await points:
 ///
@@ -462,12 +463,92 @@ impl<'pool, M: RawMutex, T: ?Sized> BufferGuard<'pool, M, &'pool mut T> {
             reference: PhantomData,
         }
     }
+
+    /// Projects a mutable guard to shared access, retaining the original slot.
+    ///
+    /// Call `BufferGuard::map_mut_ref(guard, f)` when the projection needs mutable
+    /// access but returns a shared reference, such as `Thing::do_sth(&mut self)
+    /// -> &[u8]`. The resulting guard supports only shared access and can be
+    /// projected further with [`BufferGuard::map_ref`].
+    ///
+    /// The closure must work for any input borrow lifetime; it cannot save the
+    /// buffer reference elsewhere. If it panics, the original slot is released.
+    ///
+    /// ```
+    /// use embedded_buffer_pool::{BufferGuard, BufferPool};
+    /// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    /// struct Thing([u8; 4]);
+    /// impl Thing {
+    ///     fn do_sth(&mut self) -> &[u8] {
+    ///         self.0[1] = 42;
+    ///         &self.0[1..3]
+    ///     }
+    /// }
+    /// let mut items = [Thing([0; 4])];
+    /// let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+    /// let bytes = BufferGuard::map_mut_ref(pool.try_take().unwrap(), Thing::do_sth);
+    /// assert_eq!(&*bytes, &[42, 0]);
+    /// assert_eq!(pool.available(), 0);
+    /// drop(bytes);
+    /// assert_eq!(pool.available(), 1);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use embedded_buffer_pool::{BufferGuard, BufferPool};
+    /// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    /// let mut items = [[0u8; 4]];
+    /// let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+    /// let mut shared = BufferGuard::map_mut_ref(pool.try_take().unwrap(), |b| &b[..]);
+    /// shared[0] = 1; // The projected guard has no DerefMut.
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use embedded_buffer_pool::{BufferGuard, BufferPool};
+    /// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    /// let mut items = [[0u8; 4]];
+    /// let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+    /// let mut escaped = None;
+    /// let shared = BufferGuard::map_mut_ref(pool.try_take().unwrap(), |b| {
+    ///     escaped = Some(&b[..]); // The input borrow cannot escape the closure.
+    ///     &b[..]
+    /// });
+    /// drop(shared);
+    /// let _ = escaped;
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use embedded_buffer_pool::{BufferGuard, BufferPool};
+    /// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    /// let mut items = [[0u8; 4]];
+    /// let pool = BufferPool::<NoopRawMutex, _>::new(&mut items);
+    /// let shared = BufferGuard::map_mut_ref(pool.try_take().unwrap(), |b| &b[..]);
+    /// let escaped = &*shared;
+    /// drop(shared);
+    /// assert_eq!(escaped[0], 0); // References borrow the projected guard.
+    /// ```
+    pub fn map_mut_ref<U: ?Sized>(
+        orig: Self,
+        fun: impl for<'a> FnOnce(&'a mut T) -> &'a U,
+    ) -> BufferGuard<'pool, M, &'pool U> {
+        // SAFETY: orig retains exclusive access to its slot. The closure's
+        // higher-ranked borrow cannot escape, and ends before token transfer.
+        let value = fun(unsafe { &mut *orig.value }) as *const U;
+        let Self { token, .. } = orig;
+        BufferGuard {
+            // Preserve the shared projection's provenance and metadata. The
+            // shared reference marker prevents mutable access to this pointer.
+            value: value.cast_mut(),
+            token,
+            reference: PhantomData,
+        }
+    }
 }
 
 impl<'pool, M: RawMutex, V: Deref> BufferGuard<'pool, M, V> {
     /// Projects a mutable or shared guard to shared access, retaining its slot.
     ///
     /// Call `BufferGuard::map_ref(guard, f)`. This also chains shared projections.
+    /// For a projection requiring mutable input, use [`BufferGuard::map_mut_ref`].
     /// The returned reference is tied to the input borrow and cannot escape into
     /// the closure's captured state. If the closure panics, the slot is released.
     pub fn map_ref<U: ?Sized>(
